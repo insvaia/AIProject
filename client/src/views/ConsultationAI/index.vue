@@ -265,7 +265,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from "vue";
+import { ref, onMounted, onBeforeUnmount } from "vue";
 import { Plus, Promotion } from "@element-plus/icons-vue";
 import {
   startSession,
@@ -278,6 +278,7 @@ import { ChatRound, Clock, DeleteFilled } from "@element-plus/icons-vue";
 import MarkdownRenderer from "@/components/MarkdownRenderer/index.vue";
 import { ElMessage } from "element-plus";
 import { fetchEventSource } from "@microsoft/fetch-event-source";
+import { onBeforeRouteLeave } from "vue-router";
 
 const iconUrl = new URL("@/assets/images/robot-fill.png", import.meta.url).href;
 const iconUrl1 = new URL("@/assets/images/like.png", import.meta.url).href;
@@ -340,6 +341,25 @@ const messages = ref([]);
 // 定义ai助手是否正在回复
 const isSending = ref(false);
 
+// 当前流式请求的运行时状态，用于中断与回调守卫
+let streamSessionId = null;
+let streamController = null;
+let streamTimer = null;
+let isUnmounted = false;
+
+const resetStreamState = () => {
+  if (streamTimer) {
+    clearTimeout(streamTimer);
+    streamTimer = null;
+  }
+  if (streamController) {
+    streamController.abort();
+    streamController = null;
+  }
+  streamSessionId = null;
+  isSending.value = false;
+};
+
 // 情绪花园
 const currentEmotion = ref({
   ...DEFAULT_EMOTION,
@@ -350,6 +370,7 @@ const loadSessionEmotion = (sessionId) => {
     ? sessionId
     : `session_${sessionId}`;
   getSessionEmotion(id).then((res) => {
+    if (isUnmounted) return;
     const data = res?.data ?? res;
     currentEmotion.value = normalizeEmotion(data);
   });
@@ -461,7 +482,22 @@ const startAIResponse = (sessionId, userMessage) => {
     ElMessage.warning("AI助手正在发送中，请稍候...");
     return;
   }
+  resetStreamState();
+
   isSending.value = true;
+  streamSessionId = sessionId;
+  streamController = new AbortController();
+
+  // 流式请求超时保护，避免连接悬挂
+  streamTimer = setTimeout(() => {
+    if (streamSessionId === sessionId && !isUnmounted) {
+      handleError(
+        new Error("AI回复超时"),
+        streamController,
+        "AI回复超时，请稍后再试~",
+      );
+    }
+  }, 60000);
 
   const aiMessage = {
     id: `ai_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -471,10 +507,6 @@ const startAIResponse = (sessionId, userMessage) => {
   };
   messages.value.push(aiMessage);
 
-  // 结束请求的方法
-  const ctrl = new AbortController(); // js原生的取消fetch请求方法
-
-  // 调用流式接口
   fetchEventSource("/api/psychological-chat/stream", {
     method: "POST",
     headers: {
@@ -486,50 +518,95 @@ const startAIResponse = (sessionId, userMessage) => {
       sessionId,
       userMessage,
     }),
-    signal: ctrl.signal,
+    signal: streamController.signal,
     onopen: (response) => {
+      if (streamSessionId !== sessionId || isUnmounted) return;
       if (response.headers.get("content-type") !== "text/event-stream") {
-        ElMessage.error("服务器返回数据格式异常");
+        handleError(
+          "服务器返回数据格式异常",
+          streamController,
+          "服务器返回数据格式异常",
+        );
       }
     },
     onmessage: (event) => {
+      if (streamSessionId !== sessionId || isUnmounted) return;
       const raw = event.data.trim();
       if (!raw) return;
       const eventName = event.event;
-      // 当前会话的ai消息
       const aiMessage = messages.value[messages.value.length - 1];
       if (eventName === "done") {
+        if (streamTimer) {
+          clearTimeout(streamTimer);
+          streamTimer = null;
+        }
+        streamSessionId = null;
         isSending.value = false;
-        ctrl.abort();
-        loadSessionEmotion(currentSession.value.sessionId);
+        streamController?.abort();
+        streamController = null;
+        loadSessionEmotion(sessionId);
         return;
       }
-      const payload = JSON.parse(raw);
+      let payload;
+      try {
+        payload = JSON.parse(raw);
+      } catch (e) {
+        handleError(
+          "AI助手回复数据异常，请稍后再试~",
+          streamController,
+          "AI助手回复数据异常，请稍后再试~",
+        );
+        return;
+      }
       const ok = String(payload.code) === "200";
       if (ok && payload.data && payload.data.content) {
         aiMessage.content += payload.data.content;
       } else if (!ok) {
-        // 错误回复的提示
-        handleError(payload.message || "AI助手回复失败了，请稍后再试~");
+        handleError(
+          payload.message,
+          streamController,
+          payload.message || "AI助手回复失败了，请稍后再试~",
+        );
       }
     },
     onerror: (err) => {
-      handleError(err || "AI助手回复失败了，请稍后再试~");
+      if (streamSessionId !== sessionId || isUnmounted) return;
+      handleError(err, streamController, "AI助手回复失败了，请稍后再试~");
     },
     onclose: () => {
-      // 开始情绪分析
-      loadSessionEmotion(currentSession.value.sessionId);
+      if (streamSessionId !== sessionId || isUnmounted) return;
+      if (streamTimer) {
+        clearTimeout(streamTimer);
+        streamTimer = null;
+      }
+      streamSessionId = null;
+      isSending.value = false;
+      streamController?.abort();
+      streamController = null;
+      loadSessionEmotion(sessionId);
     },
   });
 };
 
-const handleError = (err) => {
+const handleError = (err, controller, message) => {
+  const errorText = message || "AI助手回复失败了，请稍后再试~";
   const aiMessage = messages.value[messages.value.length - 1];
   if (aiMessage) {
-    aiMessage.content = "AI助手回复失败了，请稍后再试~";
+    aiMessage.content = errorText;
   }
+  if (streamTimer) {
+    clearTimeout(streamTimer);
+    streamTimer = null;
+  }
+  streamSessionId = null;
   isSending.value = false;
-  ElMessage.error("AI助手回复失败了，请稍后再试~");
+  if (controller) {
+    controller.abort();
+    if (streamController === controller) {
+      streamController = null;
+    }
+  }
+  ElMessage.error(errorText);
 };
 
 const getSessionPage = () => {
@@ -543,6 +620,8 @@ const getSessionPage = () => {
 
 // 获取会话数据
 const handleSessionClick = (session) => {
+  // 切换会话前中断正在进行的流式回复，避免旧流继续写入
+  resetStreamState();
   // 点击会话时，获取会话详情
   getSessionDetail(session.id).then((res) => {
     messages.value = res?.data ?? res;
@@ -568,6 +647,16 @@ const handleDeleteSession = (sessionId) => {
 const formatMessageContent = (content) => {
   return content.replace(/\n/g, "<br>");
 };
+
+onBeforeRouteLeave(() => {
+  resetStreamState();
+  return true;
+});
+
+onBeforeUnmount(() => {
+  isUnmounted = true;
+  resetStreamState();
+});
 
 onMounted(() => {
   createNewFrontendSession();
