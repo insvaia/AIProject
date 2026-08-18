@@ -592,6 +592,7 @@ const handleError = (err, controller, message) => {
   const errorText = message || "AI助手回复失败了，请稍后再试~";
   const aiMessage = messages.value[messages.value.length - 1];
   if (aiMessage) {
+    aiMessage.isError = true;
     aiMessage.content = errorText;
   }
   if (streamTimer) {
