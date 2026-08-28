@@ -1,4 +1,4 @@
-export const fileBaseURL = "";
+export const fileBaseURL = import.meta.env.VITE_FILE_BASE_URL || "";
 
 export const authConfig = {
   request: {

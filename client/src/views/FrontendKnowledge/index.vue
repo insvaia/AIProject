@@ -3,7 +3,7 @@
     <div class="header-section">
       <div class="header-content">
         <el-image :src="iconUrl" style="width: 60px; height: 60px"></el-image>
-        <h1>情绪日志</h1>
+        <h1>知识库</h1>
       </div>
     </div>
     <div class="content">
@@ -85,6 +85,7 @@ import { getKnowledgeList } from "@/api/frontend";
 import { Avatar, Histogram, Platform, List } from "@element-plus/icons-vue";
 import { dayjs } from "element-plus";
 import { useRouter } from "vue-router";
+import { fileBaseURL } from "@/config";
 const iconUrl = new URL("@/assets/images/book.png", import.meta.url).href;
 const router = useRouter();
 
@@ -112,9 +113,12 @@ const getPageList = () => {
 };
 
 const getImage = (url) => {
-  return url
-    ? "http://159.75.169.224:1235" + url
-    : "https://file.itndedu.com/psychology_ai.png";
+  if (!url) return iconUrl;
+  if (/^(https?:)?\/\//i.test(url) || /^(data|blob):/i.test(url)) return url;
+
+  const baseURL = fileBaseURL.replace(/\/$/, "");
+  const imagePath = url.startsWith("/") ? url : `/${url}`;
+  return `${baseURL}${imagePath}`;
 };
 
 const handleChange = (page) => {

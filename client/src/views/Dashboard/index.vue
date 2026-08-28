@@ -173,7 +173,7 @@ const initEmotionChart = () => {
       data: ["平均情绪评分", "记录数量"],
       top: 40,
     },
-    gird: {
+    grid: {
       // 控制容器样式
       left: "3%",
       right: "4%",

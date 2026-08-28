@@ -88,11 +88,23 @@ const formData = reactive({
   userType: 1,
 });
 
+const validateConfirmPassword = (_rule, value, callback) => {
+  if (!value) {
+    callback(new Error("请确认密码"));
+  } else if (value !== formData.password) {
+    callback(new Error("两次输入的密码不一致"));
+  } else {
+    callback();
+  }
+};
+
 const rules = reactive({
   username: [{ required: true, message: "请输入用户名", trigger: "blur" }],
   email: [{ required: true, message: "请输入邮箱", trigger: "blur" }],
   password: [{ required: true, message: "请输入密码", trigger: "blur" }],
-  confirmPassword: [{ required: true, message: "请确认密码", trigger: "blur" }],
+  confirmPassword: [
+    { validator: validateConfirmPassword, trigger: ["blur", "change"] },
+  ],
 });
 
 const router = useRouter();
@@ -102,7 +114,10 @@ const submitFormRef = ref(null);
 const submitForm = async (formEl) => {
   if (!formEl) return;
   formEl.validate(async (valid) => {
-    register(formData).then(({ data }) => {
+    if (!valid) return;
+
+    const { confirmPassword, ...registerData } = formData;
+    register(registerData).then(({ data }) => {
       if (!data) {
         ElMessage.success("注册成功");
         router.push("/auth/login");
