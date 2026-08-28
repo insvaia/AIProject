@@ -265,7 +265,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from "vue";
+import { ref, onMounted, onBeforeUnmount } from "vue";
 import { Plus, Promotion } from "@element-plus/icons-vue";
 import {
   startSession,
@@ -317,6 +317,11 @@ const createNewFrontendSession = () => {
     ElMessage.warning("AI助手正在回复中，请稍候再新建会话...");
     return;
   }
+
+  stopActiveStream();
+  sessionDetailRequestVersion += 1;
+  emotionRequestVersion += 1;
+
   const newSession = {
     sessionId: `temp_${Date.now()}`,
     status: "TEMP",
@@ -340,19 +345,85 @@ const messages = ref([]);
 // 定义ai助手是否正在回复
 const isSending = ref(false);
 
+// 当前活动的数据流。控制器和会话 ID 一起保存，避免旧数据流写入新会话。
+let activeStreamController = null;
+let activeStreamSessionId = null;
+// 版本号用于处理异步请求乱序：只有最后一次请求的结果可以更新页面。
+let sessionDetailRequestVersion = 0;
+let emotionRequestVersion = 0;
+// 组件卸载后即使异步回调晚到，也不再修改响应式状态。
+let isComponentActive = true;
+
+// 统一会话 ID 格式，保证列表中的数字 ID 和接口返回的 session_x 可以正确比较。
+const normalizeSessionId = (sessionId) => {
+  const id = String(sessionId ?? "");
+  if (id.startsWith("session_") || id.startsWith("temp_")) return id;
+  return `session_${id}`;
+};
+
+const isCurrentSession = (sessionId) => {
+  return (
+    currentSession.value?.sessionId === normalizeSessionId(sessionId)
+  );
+};
+
+// 第一层校验：数据流必须仍是组件当前登记的活动流，且没有被中止。
+const isActiveStream = (controller, sessionId) => {
+  return (
+    isComponentActive &&
+    !controller.signal.aborted &&
+    activeStreamController === controller &&
+    activeStreamSessionId === normalizeSessionId(sessionId)
+  );
+};
+
+// 正常结束活动流。实例校验可防止旧流的 finally 清掉新流状态。
+const finishActiveStream = (controller) => {
+  if (activeStreamController !== controller) return;
+  activeStreamController = null;
+  activeStreamSessionId = null;
+  isSending.value = false;
+};
+
+// 主动结束旧流：切换会话或组件卸载时调用，不把主动中止当作请求错误。
+const stopActiveStream = () => {
+  const controller = activeStreamController;
+  activeStreamController = null;
+  activeStreamSessionId = null;
+  isSending.value = false;
+
+  if (controller && !controller.signal.aborted) {
+    controller.abort();
+  }
+};
+
 // 情绪花园
 const currentEmotion = ref({
   ...DEFAULT_EMOTION,
 });
 
-const loadSessionEmotion = (sessionId) => {
-  const id = sessionId.toString().startsWith("session_")
-    ? sessionId
-    : `session_${sessionId}`;
-  getSessionEmotion(id).then((res) => {
+const loadSessionEmotion = async (sessionId) => {
+  const normalizedSessionId = normalizeSessionId(sessionId);
+  // 记录本次请求版本；切换会话会产生新版本，使旧响应自动失效。
+  const requestVersion = ++emotionRequestVersion;
+
+  try {
+    const res = await getSessionEmotion(normalizedSessionId);
+    if (
+      !isComponentActive ||
+      requestVersion !== emotionRequestVersion ||
+      !isCurrentSession(normalizedSessionId)
+    ) {
+      return;
+    }
+
     const data = res?.data ?? res;
     currentEmotion.value = normalizeEmotion(data);
-  });
+  } catch (error) {
+    if (isCurrentSession(normalizedSessionId)) {
+      console.error("加载会话情绪分析失败:", error);
+    }
+  }
 };
 
 const getRiskText = (level) => {
@@ -415,6 +486,9 @@ const sendMessage = async () => {
 };
 
 const startNewSession = (message) => {
+  // 捕获创建请求所属的临时会话，防止请求返回前用户已切换到其他会话。
+  const pendingSessionId = currentSession.value?.sessionId;
+
   // 构建会话参数
   const sessionParams = {
     initialMessage: message,
@@ -427,6 +501,13 @@ const startNewSession = (message) => {
   }
   // 调用后端接口创建新会话
   startSession(sessionParams).then((res) => {
+    if (
+      !isComponentActive ||
+      currentSession.value?.sessionId !== pendingSessionId
+    ) {
+      return;
+    }
+
     // 将后端返回的数据转为前端会话的格式
     const sessionData = {
       sessionId: res.sessionId,
@@ -452,7 +533,7 @@ const startNewSession = (message) => {
     });
 
     // 开始流式对话
-    startAIResponse(currentSession.value.sessionId, message);
+    startAIResponse(sessionData.sessionId, message);
   });
 };
 
@@ -461,21 +542,64 @@ const startAIResponse = (sessionId, userMessage) => {
     ElMessage.warning("AI助手正在发送中，请稍候...");
     return;
   }
+
+  // 任意时刻只允许存在一条活动流，启动前先清理可能残留的旧连接。
+  stopActiveStream();
   isSending.value = true;
 
+  const streamSessionId = normalizeSessionId(sessionId);
+  const controller = new AbortController();
+  // 保存到组件作用域，切换会话和组件卸载时才能访问并中止该请求。
+  activeStreamController = controller;
+  activeStreamSessionId = streamSessionId;
+
+  // 固定保存本次流对应的消息对象，不能再通过 messages 最后一项定位。
   const aiMessage = {
     id: `ai_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+    sessionId: streamSessionId,
     senderType: 2,
     content: "",
     createdAt: new Date().toISOString(),
   };
   messages.value.push(aiMessage);
 
-  // 结束请求的方法
-  const ctrl = new AbortController(); // js原生的取消fetch请求方法
+  let streamFinished = false;
+
+  // 第二层校验：活动流归属正确，并且用户当前仍停留在该会话。
+  // 即使 abort 与网络数据到达存在时间差，晚到的数据也会在这里被丢弃。
+  const canWriteToCurrentSession = () => {
+    return (
+      isActiveStream(controller, streamSessionId) &&
+      isCurrentSession(streamSessionId)
+    );
+  };
+
+  // done 和 onclose 都可能触发结束逻辑，streamFinished 保证只执行一次。
+  const completeStream = () => {
+    if (streamFinished) return;
+    streamFinished = true;
+
+    const shouldLoadEmotion = canWriteToCurrentSession();
+    finishActiveStream(controller);
+    if (!controller.signal.aborted) controller.abort();
+
+    if (shouldLoadEmotion) {
+      loadSessionEmotion(streamSessionId);
+    }
+  };
+
+  const failStream = (message) => {
+    if (!canWriteToCurrentSession()) return;
+    streamFinished = true;
+    aiMessage.isError = true;
+    aiMessage.content = message;
+    finishActiveStream(controller);
+    if (!controller.signal.aborted) controller.abort();
+    ElMessage.error(message);
+  };
 
   // 调用流式接口
-  fetchEventSource("/api/psychological-chat/stream", {
+  void fetchEventSource("/api/psychological-chat/stream", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -483,53 +607,64 @@ const startAIResponse = (sessionId, userMessage) => {
       Accept: "text/event-stream",
     },
     body: JSON.stringify({
-      sessionId,
+      sessionId: streamSessionId,
       userMessage,
     }),
-    signal: ctrl.signal,
+    // 将控制器与本次 SSE 请求关联，调用 abort() 后底层连接会被终止。
+    signal: controller.signal,
     onopen: (response) => {
-      if (response.headers.get("content-type") !== "text/event-stream") {
-        ElMessage.error("服务器返回数据格式异常");
+      const contentType = response.headers.get("content-type") || "";
+      if (!response.ok || !contentType.includes("text/event-stream")) {
+        throw new Error("服务器返回数据格式异常");
       }
     },
     onmessage: (event) => {
+      // 每个数据片段写入前都校验归属，旧会话的数据不能进入新会话。
+      if (!canWriteToCurrentSession()) return;
+
       const raw = event.data.trim();
       if (!raw) return;
-      const eventName = event.event;
-      // 当前会话的ai消息
-      const aiMessage = messages.value[messages.value.length - 1];
-      if (eventName === "done") {
-        isSending.value = false;
-        ctrl.abort();
-        loadSessionEmotion(currentSession.value.sessionId);
+
+      if (event.event === "done") {
+        completeStream();
         return;
       }
-      const payload = JSON.parse(raw);
+
+      let payload;
+      try {
+        payload = JSON.parse(raw);
+      } catch {
+        failStream("AI助手返回的数据格式异常，请稍后再试~");
+        return;
+      }
+
       const ok = String(payload.code) === "200";
       if (ok && payload.data && payload.data.content) {
         aiMessage.content += payload.data.content;
       } else if (!ok) {
-        // 错误回复的提示
-        handleError(payload.message || "AI助手回复失败了，请稍后再试~");
+        failStream(payload.message || "AI助手回复失败了，请稍后再试~");
       }
     },
     onerror: (err) => {
-      handleError(err || "AI助手回复失败了，请稍后再试~");
+      throw err;
     },
     onclose: () => {
-      // 开始情绪分析
-      loadSessionEmotion(currentSession.value.sessionId);
+      completeStream();
     },
-  });
-};
-
-const handleError = (err) => {
-  const aiMessage = messages.value[messages.value.length - 1];
-  if (aiMessage) {
-    aiMessage.content = "AI助手回复失败了，请稍后再试~";
-  }
-  isSending.value = false;
-  ElMessage.error("AI助手回复失败了，请稍后再试~");
+  })
+    .catch((error) => {
+      // 用户切换会话造成的主动中止属于正常流程，不显示错误提示。
+      if (
+        controller.signal.aborted ||
+        !isActiveStream(controller, streamSessionId)
+      ) {
+        return;
+      }
+      failStream(error?.message || "AI助手回复失败了，请稍后再试~");
+    })
+    .finally(() => {
+      finishActiveStream(controller);
+    });
 };
 
 const getSessionPage = () => {
@@ -537,24 +672,47 @@ const getSessionPage = () => {
     pageNum: 1,
     pageSize: 10,
   }).then((res) => {
+    if (!isComponentActive) return;
     sessionList.value = res?.records || res?.data?.records || [];
   });
 };
 
 // 获取会话数据
-const handleSessionClick = (session) => {
-  // 点击会话时，获取会话详情
-  getSessionDetail(session.id).then((res) => {
-    messages.value = res?.data ?? res;
-  });
-  loadSessionEmotion(session.id);
-  // 更新当前会话对象数据
-  const sessionData = {
-    sessionId: "session_" + session.id,
+const handleSessionClick = async (session) => {
+  // 切换前先中止旧 SSE，阻断旧会话继续产生前端数据。
+  stopActiveStream();
+
+  const targetSessionId = normalizeSessionId(session.id);
+  // 快速连续点击多个会话时，只接受最后一次详情请求的响应。
+  const requestVersion = ++sessionDetailRequestVersion;
+  currentSession.value = {
+    sessionId: targetSessionId,
     status: "ACTIVE",
     sessionTitle: session.sessionTitle,
   };
-  currentSession.value = sessionData;
+  messages.value = [];
+  resetEmotion();
+  loadSessionEmotion(targetSessionId);
+
+  try {
+    const res = await getSessionDetail(session.id);
+    if (
+      !isComponentActive ||
+      requestVersion !== sessionDetailRequestVersion ||
+      !isCurrentSession(targetSessionId)
+    ) {
+      return;
+    }
+    messages.value = res?.data ?? res;
+  } catch (error) {
+    if (
+      isComponentActive &&
+      requestVersion === sessionDetailRequestVersion &&
+      isCurrentSession(targetSessionId)
+    ) {
+      ElMessage.error("会话记录加载失败，请稍后重试");
+    }
+  }
 };
 
 const handleDeleteSession = (sessionId) => {
@@ -572,6 +730,14 @@ const formatMessageContent = (content) => {
 onMounted(() => {
   createNewFrontendSession();
   getSessionPage();
+});
+
+onBeforeUnmount(() => {
+  // 页面离开后统一释放连接，并让尚未完成的详情/情绪请求全部失效。
+  isComponentActive = false;
+  sessionDetailRequestVersion += 1;
+  emotionRequestVersion += 1;
+  stopActiveStream();
 });
 </script>
 
