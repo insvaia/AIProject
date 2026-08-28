@@ -278,6 +278,7 @@ import { ChatRound, Clock, DeleteFilled } from "@element-plus/icons-vue";
 import MarkdownRenderer from "@/components/MarkdownRenderer/index.vue";
 import { ElMessage } from "element-plus";
 import { fetchEventSource } from "@microsoft/fetch-event-source";
+import { onBeforeRouteLeave } from "vue-router";
 
 const iconUrl = new URL("@/assets/images/robot-fill.png", import.meta.url).href;
 const iconUrl1 = new URL("@/assets/images/like.png", import.meta.url).href;
@@ -348,6 +349,7 @@ const isSending = ref(false);
 // 当前活动的数据流。控制器和会话 ID 一起保存，避免旧数据流写入新会话。
 let activeStreamController = null;
 let activeStreamSessionId = null;
+let activeStreamTimer = null;
 // 版本号用于处理异步请求乱序：只有最后一次请求的结果可以更新页面。
 let sessionDetailRequestVersion = 0;
 let emotionRequestVersion = 0;
@@ -377,9 +379,16 @@ const isActiveStream = (controller, sessionId) => {
   );
 };
 
+const clearActiveStreamTimer = () => {
+  if (!activeStreamTimer) return;
+  clearTimeout(activeStreamTimer);
+  activeStreamTimer = null;
+};
+
 // 正常结束活动流。实例校验可防止旧流的 finally 清掉新流状态。
 const finishActiveStream = (controller) => {
   if (activeStreamController !== controller) return;
+  clearActiveStreamTimer();
   activeStreamController = null;
   activeStreamSessionId = null;
   isSending.value = false;
@@ -388,6 +397,7 @@ const finishActiveStream = (controller) => {
 // 主动结束旧流：切换会话或组件卸载时调用，不把主动中止当作请求错误。
 const stopActiveStream = () => {
   const controller = activeStreamController;
+  clearActiveStreamTimer();
   activeStreamController = null;
   activeStreamSessionId = null;
   isSending.value = false;
@@ -542,7 +552,6 @@ const startAIResponse = (sessionId, userMessage) => {
     ElMessage.warning("AI助手正在发送中，请稍候...");
     return;
   }
-
   // 任意时刻只允许存在一条活动流，启动前先清理可能残留的旧连接。
   stopActiveStream();
   isSending.value = true;
@@ -598,6 +607,13 @@ const startAIResponse = (sessionId, userMessage) => {
     ElMessage.error(message);
   };
 
+  // 继承远端的超时保护，避免 SSE 长时间无响应而一直占用连接。
+  activeStreamTimer = setTimeout(() => {
+    if (canWriteToCurrentSession()) {
+      failStream("AI回复超时，请稍后再试~");
+    }
+  }, 60000);
+
   // 调用流式接口
   void fetchEventSource("/api/psychological-chat/stream", {
     method: "POST",
@@ -637,7 +653,6 @@ const startAIResponse = (sessionId, userMessage) => {
         failStream("AI助手返回的数据格式异常，请稍后再试~");
         return;
       }
-
       const ok = String(payload.code) === "200";
       if (ok && payload.data && payload.data.content) {
         aiMessage.content += payload.data.content;
@@ -726,6 +741,14 @@ const handleDeleteSession = (sessionId) => {
 const formatMessageContent = (content) => {
   return content.replace(/\n/g, "<br>");
 };
+
+onBeforeRouteLeave(() => {
+  // 路由离开时提前停止数据流；即使组件被缓存，也不会继续接收旧会话数据。
+  sessionDetailRequestVersion += 1;
+  emotionRequestVersion += 1;
+  stopActiveStream();
+  return true;
+});
 
 onMounted(() => {
   createNewFrontendSession();

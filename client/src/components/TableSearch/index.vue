@@ -33,7 +33,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed } from "vue";
+import { ref, reactive, computed, onMounted } from "vue";
 
 const props = defineProps({
   formItem: {
@@ -75,4 +75,8 @@ const handleReset = (formEl) => {
   formEl.resetFields();
   emit("search", formData);
 };
+
+onMounted(() => {
+  handleSearch()
+});
 </script>

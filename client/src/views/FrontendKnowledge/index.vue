@@ -106,10 +106,14 @@ const getPageList = () => {
     sortDirection: "desc",
     ...pagination,
   };
-  getKnowledgeList(params).then((res) => {
-    articleList.value = res.records;
-    pagination.total = res.total;
-  });
+  getKnowledgeList(params)
+    .then((res) => {
+      articleList.value = res.records;
+      pagination.total = res.total;
+    })
+    .catch(() => {
+      // 请求失败(如未登录 403)由拦截器统一提示并跳登录,这里静默即可
+    });
 };
 
 const getImage = (url) => {
@@ -138,9 +142,13 @@ onMounted(() => {
     size: 5,
   };
   getPageList();
-  getKnowledgeList(params).then((res) => {
-    recommendList.value = res.records;
-  });
+  getKnowledgeList(params)
+    .then((res) => {
+      recommendList.value = res.records;
+    })
+    .catch(() => {
+      // 请求失败(如未登录 403)由拦截器统一提示并跳登录,这里静默即可
+    });
 });
 </script>
 
